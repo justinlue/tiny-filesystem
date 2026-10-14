@@ -187,6 +187,8 @@ static void append_past_max_size_is_rejected(void)
     CHECK_EQ(tfs_append(&fs, "f", big, 6), TFS_ERR_FBIG);
     CHECK_EQ(tfs_append(&fs, "f", big, 5), 0);
     CHECK_EQ(tfs_size(&fs, "f"), 925);
+    CHECK_EQ(tfs_append(&fs, "f", big, 0xFFFFFFFFu), TFS_ERR_FBIG);   /* no wraparound */
+    CHECK_EQ(tfs_write(&fs, "f", big, 0xFFFFFFFFu), TFS_ERR_FBIG);
     teardown();
 }
 
@@ -375,6 +377,8 @@ static void bad_configs_are_rejected(void)
     bad = cfg; bad.prog_size = 32;
     CHECK_EQ(tfs_mount(&fs, &bad), TFS_ERR_INVAL);
     bad = cfg; bad.sector_size = 1000;
+    CHECK_EQ(tfs_format(&fs, &bad), TFS_ERR_INVAL);
+    bad = cfg; bad.base = 0xFFFFF400u;                 /* 4 KB region runs past 4 GB */
     CHECK_EQ(tfs_format(&fs, &bad), TFS_ERR_INVAL);
     bad = cfg; bad.erase = 0;
     CHECK_EQ(tfs_format(&fs, &bad), TFS_ERR_INVAL);

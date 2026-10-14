@@ -86,7 +86,8 @@ static int check_config(const struct tfs_config *cfg)
 {
     uint32_t p = cfg->prog_size, s = cfg->sector_size;
     if (!cfg->read || !cfg->prog || !cfg->erase || cfg->sector_count < 2 || cfg->sector_count > 0xFFFF
-        || p < 1 || p > MAX_PROG || (p & (p - 1)) || s < 128 || (s & (s - 1)))
+        || p < 1 || p > MAX_PROG || (p & (p - 1)) || s < 128 || (s & (s - 1))
+        || cfg->sector_count > (0xFFFFFFFFu - cfg->base) / s + 1)   /* region ends within 4 GB */
         return TFS_ERR_INVAL;
     return 0;
 }
@@ -865,7 +866,7 @@ static int do_append(tfs_t *fs, const char *name, const void *buf, uint32_t len)
         return TFS_ERR_INVAL;
     if ((res = file_size(fs, &f.base, &size, &appends, &old_fp)) != 0)
         return res;
-    if (size + len > (uint32_t)tfs_max_file_size(fs->cfg))
+    if (len > (uint32_t)tfs_max_file_size(fs->cfg) - size)
         return TFS_ERR_FBIG;
     memset(&s, 0, sizeof s);
     s.data = buf;
