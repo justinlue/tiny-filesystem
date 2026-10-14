@@ -121,6 +121,9 @@ static void oversized_file_is_rejected_before_writing(void)
     /* 1024 - header 24 - reserved GC_DONE 20 - reserved DELETE 20 - commit 4
      *      - record header 16 - name 15 */
     CHECK_EQ(max, 925);
+    cfg.sector_size = 4096;
+    CHECK_EQ(tfs_max_file_size(&cfg), 3997);   /* the figure DESIGN.md quotes */
+    cfg.sector_size = 1024;
     CHECK_EQ(tfs_write(&fs, "big", big, (uint32_t)max + 1), TFS_ERR_FBIG);
     CHECK_EQ(tfs_size(&fs, "big"), TFS_ERR_NOENT);
     CHECK_EQ(tfs_write(&fs, "0123456789abcde", big, (uint32_t)max), 0);

@@ -268,20 +268,16 @@ static int activate(tfs_t *fs, uint32_t idx, uint32_t gc_src)
 }
 
 /* Walk the committed records of sector idx, calling cb (if any) on each; a
- * non-zero cb result stops the walk and is returned. On return *end is the
- * offset after the last committed record and *torn tells whether the walk
- * stopped at something that is neither a record nor erased flash. With verify,
- * a committed record whose CRC does not match returns TFS_ERR_CORRUPT. */
-static int scan_sector(tfs_t *fs, uint32_t idx, rec_cb cb, void *ctx, uint32_t *end, int *torn,
-                       int verify)
+ * non-zero cb result stops the walk and is returned. The walk ends at erased
+ * flash or at the first record that is not committed. With verify, a committed
+ * record whose CRC does not match returns TFS_ERR_CORRUPT. */
+static int scan_sector(tfs_t *fs, uint32_t idx, rec_cb cb, void *ctx, int verify)
 {
     const struct tfs_config *cfg = fs->cfg;
     uint32_t base = sec_addr(fs, idx), off = al(fs, HDR_LEN), i, fp, c;
     uint8_t h[REC_LEN], u[MAX_PROG];
     struct rec r;
     int res, bad;
-    if (torn)
-        *torn = 0;
     while (off + fp_of(fs, 0, 0) <= cfg->sector_size) {
         if (rd(fs, base + off, h, REC_LEN))
             return TFS_ERR_IO;
@@ -308,11 +304,8 @@ static int scan_sector(tfs_t *fs, uint32_t idx, rec_cb cb, void *ctx, uint32_t *
         } else {
             bad = 1;
         }
-        if (bad) {
-            if (torn)
-                *torn = 1;
+        if (bad)
             break;
-        }
         if (verify) {
             c = crc_buf(NONE, h, 12);
             if (crc_flash(fs, &c, r.addr + REC_LEN, r.nlen + r.len))
@@ -324,8 +317,6 @@ static int scan_sector(tfs_t *fs, uint32_t idx, rec_cb cb, void *ctx, uint32_t *
             return res;
         off += fp;
     }
-    if (end)
-        *end = off;
     return 0;
 }
 
@@ -335,7 +326,7 @@ static int scan(tfs_t *fs, rec_cb cb, void *ctx)
     uint32_t i = fs->oldest;
     int res;
     for (;;) {
-        if ((res = scan_sector(fs, i, cb, ctx, 0, 0, 0)) != 0)
+        if ((res = scan_sector(fs, i, cb, ctx, 0)) != 0)
             return res;
         if (i == fs->head)
             return 0;
@@ -602,7 +593,7 @@ static int gc_step(tfs_t *fs)
         return res;
     for (b.first = 0; b.first < TFS_MAX_FILES; b.first += BATCH)
         if ((res = base_batch(fs, &b)) != 0
-            || (res = scan_sector(fs, src, copy_live_cb, &b, 0, 0, 0)) != 0)
+            || (res = scan_sector(fs, src, copy_live_cb, &b, 0)) != 0)
             return res;
     if ((res = put_record(fs, K_GCDONE, 0, 0, 0, &none)) != 0)
         return res;
@@ -677,7 +668,7 @@ static int do_mount(tfs_t *fs)
             return TFS_ERR_CORRUPT;
         if (skip != NONE || head_gc == NONE)
             break;
-        if ((res = scan_sector(fs, top, gcdone_cb, 0, 0, 0, 0)) < 0)
+        if ((res = scan_sector(fs, top, gcdone_cb, 0, 0)) < 0)
             return res;
         if (res)
             break;
@@ -705,7 +696,7 @@ static int do_mount(tfs_t *fs)
     }
     fs->next_seq = 1;
     for (i = fs->oldest;; i = next_sec(fs, i)) {
-        if ((res = scan_sector(fs, i, max_seq_cb, &fs->next_seq, 0, 0, 1)) != 0)
+        if ((res = scan_sector(fs, i, max_seq_cb, &fs->next_seq, 1)) != 0)
             return res;
         if (i == fs->head)
             break;
