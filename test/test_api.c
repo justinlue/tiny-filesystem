@@ -118,8 +118,9 @@ static void oversized_file_is_rejected_before_writing(void)
     int max;
     mounted(1024, 4, 4);
     max = tfs_max_file_size(&cfg);
-    /* 1024 - header 24 - reserved GC_DONE 20 - commit 4 - record header 16 - name 15 */
-    CHECK_EQ(max, 945);
+    /* 1024 - header 24 - reserved GC_DONE 20 - reserved DELETE 20 - commit 4
+     *      - record header 16 - name 15 */
+    CHECK_EQ(max, 925);
     CHECK_EQ(tfs_write(&fs, "big", big, (uint32_t)max + 1), TFS_ERR_FBIG);
     CHECK_EQ(tfs_size(&fs, "big"), TFS_ERR_NOENT);
     CHECK_EQ(tfs_write(&fs, "0123456789abcde", big, (uint32_t)max), 0);
@@ -179,10 +180,10 @@ static void append_past_max_size_is_rejected(void)
 {
     static char big[1024];
     mounted(1024, 4, 4);
-    CHECK_EQ(tfs_write(&fs, "f", big, 940), 0);
+    CHECK_EQ(tfs_write(&fs, "f", big, 920), 0);
     CHECK_EQ(tfs_append(&fs, "f", big, 6), TFS_ERR_FBIG);
     CHECK_EQ(tfs_append(&fs, "f", big, 5), 0);
-    CHECK_EQ(tfs_size(&fs, "f"), 945);
+    CHECK_EQ(tfs_size(&fs, "f"), 925);
     teardown();
 }
 
@@ -272,6 +273,74 @@ static void churn_two_sectors(void) { churn(2, 4); }
 static void churn_eight_sectors(void) { churn(8, 4); }
 static void churn_prog16(void) { churn(4, 16); }
 
+static void full_fs_says_nospc_and_keeps_data(void)
+{
+    static char data[925];
+    char name[8], buf[300];
+    int i, n, res;
+    long ops;
+    mounted(1024, 4, 4);
+    for (n = 0;; n++) {
+        sprintf(name, "f%d", n);
+        memset(data, 'a' + n % 26, 300);
+        res = tfs_write(&fs, name, data, 300);
+        if (res == TFS_ERR_NOSPC)
+            break;
+        CHECK_EQ(res, 0);
+    }
+    /* 960 usable bytes per sector hold two 324-byte records; 3 sectors hold data */
+    CHECK_EQ(n, 6);
+    CHECK_EQ(tfs_write(&fs, name, data, 300), TFS_ERR_NOSPC);
+    ops = sim.ops;
+    /* clearly over capacity: rejected before any program or erase */
+    CHECK_EQ(tfs_write(&fs, "huge", data, sizeof data), TFS_ERR_NOSPC);
+    CHECK_EQ(sim.ops, ops);
+    CHECK_EQ(tfs_remove(&fs, "f1"), 0);               /* a full fs can always delete */
+    CHECK_EQ(tfs_write(&fs, name, data, 300), 0);
+    CHECK_EQ(tfs_mount(&fs, &cfg), 0);
+    for (i = 0; i <= n; i++) {
+        sprintf(name, "f%d", i);
+        memset(data, 'a' + i % 26, 300);
+        if (i == 1) {
+            CHECK_EQ(tfs_size(&fs, name), TFS_ERR_NOENT);
+            continue;
+        }
+        CHECK_EQ(tfs_read(&fs, name, 0, buf, sizeof buf), (int)sizeof buf);
+        CHECK(memcmp(buf, data, sizeof buf) == 0);
+    }
+    CHECK_EQ(sim.violations, 0);
+    teardown();
+}
+
+/* Replacing a file keeps the old version until the new one commits, so both must fit. */
+static void largest_file_rewrites_need_three_sectors(void)
+{
+    static char big[1024], buf[1024];
+    int max, i;
+    mounted(1024, 2, 16);
+    max = tfs_max_file_size(&cfg);
+    memset(big, 'a', sizeof big);
+    CHECK_EQ(tfs_write(&fs, "0123456789abcde", big, (uint32_t)max), 0);
+    CHECK_EQ(tfs_write(&fs, "0123456789abcde", big, (uint32_t)max), TFS_ERR_NOSPC);
+    CHECK_EQ(tfs_write(&fs, "x", "", 0), TFS_ERR_NOSPC);
+    CHECK_EQ(tfs_read(&fs, "0123456789abcde", 0, buf, sizeof buf), max);
+    CHECK(memcmp(buf, big, (size_t)max) == 0);
+    CHECK_EQ(tfs_remove(&fs, "0123456789abcde"), 0);     /* a full fs can always delete */
+    CHECK_EQ(tfs_write(&fs, "x", "", 0), 0);
+    CHECK_EQ(sim.violations, 0);
+    teardown();
+
+    mounted(1024, 3, 16);
+    for (i = 0; i < 20; i++) {
+        memset(big, 'a' + i, sizeof big);
+        CHECK_EQ(tfs_write(&fs, "0123456789abcde", big, (uint32_t)max), 0);
+    }
+    CHECK_EQ(tfs_read(&fs, "0123456789abcde", 0, buf, sizeof buf), max);
+    CHECK(memcmp(buf, big, (size_t)max) == 0);
+    CHECK_EQ(sim.violations, 0);
+    teardown();
+}
+
 void api_tests(void)
 {
     RUN(blank_flash_does_not_mount);
@@ -288,4 +357,6 @@ void api_tests(void)
     RUN(churn_two_sectors);
     RUN(churn_eight_sectors);
     RUN(churn_prog16);
+    RUN(full_fs_says_nospc_and_keeps_data);
+    RUN(largest_file_rewrites_need_three_sectors);
 }

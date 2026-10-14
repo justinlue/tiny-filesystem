@@ -37,6 +37,7 @@ typedef struct tfs {
     uint32_t live;          /* footprint of live records, bytes */
     uint16_t oldest, head;  /* sector indices; the log runs oldest..head circularly */
     uint8_t retired;        /* head sector takes no more records */
+    uint8_t gc_done;        /* head sector already holds its GC_DONE record */
 } tfs_t;
 
 typedef struct { uint8_t next_id; } tfs_dir_t;
