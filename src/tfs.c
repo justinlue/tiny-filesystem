@@ -151,14 +151,29 @@ static void wr_commit(struct wr *w)
         wr_put(w, &commit_pat[i & 3], 1);
 }
 
-/* Payload of a record being written: optional data from RAM. */
+/* Payload of a record being written: the current content of the file whose
+ * base is `base` (if any, `base_size` bytes), followed by `len` bytes of data. */
 struct src {
+    const struct rec *base;
+    uint32_t base_size;
     const void *data;
     uint32_t len;
 };
 
+static int walk(tfs_t *fs, const struct rec *base,
+                int (*fn)(tfs_t *, uint32_t, uint32_t, void *), void *ctx);
+
+static int feed_seg(tfs_t *fs, uint32_t addr, uint32_t len, void *ctx)
+{
+    (void)fs;
+    wr_flash(ctx, addr, len);
+    return 0;
+}
+
 static void feed(struct wr *w, const struct src *s)
 {
+    if (s->base && walk(w->fs, s->base, feed_seg, w))
+        w->err = 1;
     wr_put(w, s->data, s->len);
 }
 
@@ -173,7 +188,7 @@ static int put_record(tfs_t *fs, uint8_t kind, uint16_t id, const char *name, ui
     h[2] = (uint8_t)id;
     h[3] = (uint8_t)(id >> 8);
     put32(h + 4, fs->next_seq);
-    put32(h + 8, s->len);
+    put32(h + 8, s->base_size + s->len);
 
     memset(&w, 0, sizeof w);                   /* dry pass: CRC only */
     w.fs = fs;
@@ -421,6 +436,64 @@ static int live_ids(tfs_t *fs, uint8_t live[TFS_MAX_FILES / 8])
     return scan(fs, ids_cb, live);
 }
 
+/* The appends that belong to the file whose base is c->base: how many, how many
+ * bytes, and the first one with seq > c->after. */
+struct chain {
+    const struct rec *base;
+    uint32_t after, count, bytes;
+    uint8_t found;
+    struct rec next;
+};
+
+static int chain_cb(tfs_t *fs, const struct rec *r, void *ctx)
+{
+    struct chain *c = ctx;
+    (void)fs;
+    if (r->kind != K_APPEND || r->id != c->base->id || r->seq < c->base->seq)
+        return 0;
+    c->count++;
+    c->bytes += r->len;
+    if (r->seq > c->after && (!c->found || r->seq < c->next.seq)) {
+        c->found = 1;
+        c->next = *r;
+    }
+    return 0;
+}
+
+static int chain(tfs_t *fs, const struct rec *base, uint32_t after, struct chain *c)
+{
+    memset(c, 0, sizeof *c);
+    c->base = base;
+    c->after = after;
+    return scan(fs, chain_cb, c);
+}
+
+/* Call fn on each piece of the file's content in order: base payload, then appends. */
+static int walk(tfs_t *fs, const struct rec *base,
+                int (*fn)(tfs_t *, uint32_t, uint32_t, void *), void *ctx)
+{
+    struct chain c;
+    int res = fn(fs, base->addr + REC_LEN + base->nlen, base->len, ctx);
+    uint32_t after = base->seq;
+    while (!res) {
+        if ((res = chain(fs, base, after, &c)) != 0 || !c.found)
+            break;
+        res = fn(fs, c.next.addr + REC_LEN, c.next.len, ctx);
+        after = c.next.seq;
+    }
+    return res;
+}
+
+static int file_size(tfs_t *fs, const struct rec *base, uint32_t *size, uint32_t *appends)
+{
+    struct chain c;
+    int res = chain(fs, base, base->seq, &c);
+    *size = base->len + c.bytes;
+    if (appends)
+        *appends = c.count;
+    return res;
+}
+
 /* ---- public API ------------------------------------------------------- */
 
 static void lock(tfs_t *fs)
@@ -510,29 +583,57 @@ int tfs_mount(tfs_t *fs, const struct tfs_config *cfg)
 int tfs_size(tfs_t *fs, const char *name)
 {
     struct find f;
+    uint32_t size;
     int res;
     lock(fs);
     res = find(fs, name, &f);
     if (res == 0)
         res = TFS_ERR_NOENT;
-    else if (res > 0)
-        res = (int)f.base.len;
+    else if (res > 0 && (res = file_size(fs, &f.base, &size, 0)) == 0)
+        res = (int)size;
     return unlock(fs, res);
+}
+
+struct rd_ctx {
+    uint32_t off, len, done;
+    uint8_t *buf;
+};
+
+static int read_seg(tfs_t *fs, uint32_t addr, uint32_t len, void *ctx)
+{
+    struct rd_ctx *r = ctx;
+    uint32_t n;
+    if (r->off >= len) {
+        r->off -= len;
+        return 0;
+    }
+    n = len - r->off;
+    if (n > r->len - r->done)
+        n = r->len - r->done;
+    if (rd(fs, addr + r->off, r->buf + r->done, n))
+        return TFS_ERR_IO;
+    r->off = 0;
+    r->done += n;
+    return r->done == r->len;              /* 1 stops the walk: buffer full */
 }
 
 static int do_read(tfs_t *fs, const char *name, uint32_t off, void *buf, uint32_t len)
 {
     struct find f;
+    struct rd_ctx r;
     int res = find(fs, name, &f);
     if (res <= 0)
         return res ? res : TFS_ERR_NOENT;
-    if (off >= f.base.len)
+    if (!buf && len)
+        return TFS_ERR_INVAL;
+    if (!len)
         return 0;
-    if (len > f.base.len - off)
-        len = f.base.len - off;
-    if (rd(fs, f.base.addr + REC_LEN + f.base.nlen + off, buf, len))
-        return TFS_ERR_IO;
-    return (int)len;
+    r.off = off;
+    r.len = len;
+    r.done = 0;
+    r.buf = buf;
+    res = walk(fs, &f.base, read_seg, &r);
+    return res < 0 ? res : (int)r.done;
 }
 
 int tfs_read(tfs_t *fs, const char *name, uint32_t off, void *buf, uint32_t len)
@@ -566,6 +667,7 @@ static int do_write(tfs_t *fs, const char *name, const void *buf, uint32_t len)
     }
     if ((res = ensure_space(fs, fp_of(fs, f.nlen, len))) != 0)
         return res;
+    memset(&s, 0, sizeof s);
     s.data = buf;
     s.len = len;
     return put_record(fs, K_WRITE, id, name, f.nlen, &s);
@@ -575,4 +677,62 @@ int tfs_write(tfs_t *fs, const char *name, const void *buf, uint32_t len)
 {
     lock(fs);
     return unlock(fs, do_write(fs, name, buf, len));
+}
+
+static int do_remove(tfs_t *fs, const char *name)
+{
+    struct find f;
+    struct src s = {0, 0, 0, 0};
+    int res = find(fs, name, &f);
+    if (res <= 0)
+        return res ? res : TFS_ERR_NOENT;
+    if ((res = ensure_space(fs, fp_of(fs, 0, 0))) != 0)
+        return res;
+    return put_record(fs, K_DELETE, f.base.id, 0, 0, &s);
+}
+
+int tfs_remove(tfs_t *fs, const char *name)
+{
+    lock(fs);
+    return unlock(fs, do_remove(fs, name));
+}
+
+#define MAX_APPENDS 8
+
+static int do_append(tfs_t *fs, const char *name, const void *buf, uint32_t len)
+{
+    struct find f;
+    struct src s;
+    uint32_t size, appends;
+    int res = find(fs, name, &f);
+    if (res <= 0)
+        return res ? res : do_write(fs, name, buf, len);
+    if (!buf && len)
+        return TFS_ERR_INVAL;
+    if ((res = file_size(fs, &f.base, &size, &appends)) != 0)
+        return res;
+    if (size + len > (uint32_t)tfs_max_file_size(fs->cfg))
+        return TFS_ERR_FBIG;
+    memset(&s, 0, sizeof s);
+    s.data = buf;
+    s.len = len;
+    if (appends < MAX_APPENDS) {
+        if ((res = ensure_space(fs, fp_of(fs, 0, len))) != 0)
+            return res;
+        return put_record(fs, K_APPEND, f.base.id, 0, 0, &s);
+    }
+    /* chain is long: write old content + new data as one WRITE record */
+    if ((res = ensure_space(fs, fp_of(fs, f.nlen, size + len))) != 0)
+        return res;
+    if ((res = find(fs, name, &f)) < 0)       /* GC may have moved the records */
+        return res;
+    s.base = &f.base;
+    s.base_size = size;
+    return put_record(fs, K_WRITE, f.base.id, name, f.nlen, &s);
+}
+
+int tfs_append(tfs_t *fs, const char *name, const void *buf, uint32_t len)
+{
+    lock(fs);
+    return unlock(fs, do_append(fs, name, buf, len));
 }
