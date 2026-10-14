@@ -123,6 +123,7 @@ int sim_erase(void *ctx, uint32_t addr)
         return SIM_ERR_CUT;
     if (!in_range(s, addr, s->sector_size) || off % s->sector_size)
         return violation(s);
+    s->erases++;
     if (!cut_now(s)) {
         memset(s->mem + off, 0xFF, s->sector_size);
         memset(s->programmed + off / p, 0, s->sector_size / p);

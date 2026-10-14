@@ -954,3 +954,17 @@ int tfs_dir_next(tfs_t *fs, tfs_dir_t *it, struct tfs_info *info)
     lock(fs);
     return unlock(fs, do_dir_next(fs, it, info));
 }
+
+/* Pay for the next GC now: if the head is (nearly) full and the next head
+ * advance would need a GC, run it. Returns 1 if a GC ran, 0 if not needed. */
+int tfs_gc(tfs_t *fs)
+{
+    const struct tfs_config *cfg = fs->cfg;
+    int res = 0;
+    lock(fs);
+    if (used_sectors(fs) + 1 == cfg->sector_count
+        && (fs->retired || cfg->sector_size - fs->head_off < cfg->sector_size / 4))
+        if ((res = gc_step(fs)) == 0)
+            res = 1;
+    return unlock(fs, res);
+}

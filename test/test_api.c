@@ -341,6 +341,102 @@ static void largest_file_rewrites_need_three_sectors(void)
     teardown();
 }
 
+static void idle_gc_saves_the_next_write_from_collecting(void)
+{
+    static char data[300];
+    long erases;
+    int i;
+    mounted(1024, 4, 4);
+    CHECK_EQ(tfs_gc(&fs), 0);                        /* free sectors left: nothing to do */
+    for (i = 0; i < 9; i++)                          /* rewrites leave dead records behind */
+        CHECK_EQ(tfs_write(&fs, i % 2 ? "a" : "b", data, sizeof data), 0);
+    CHECK_EQ(tfs_mount(&fs, &cfg), 0);               /* head now takes no more records */
+    CHECK_EQ(tfs_gc(&fs), 1);
+    erases = sim.erases;
+    CHECK_EQ(tfs_write(&fs, "c", "x", 1), 0);
+    CHECK_EQ(sim.erases, erases);
+    CHECK_EQ(tfs_size(&fs, "a"), 300);
+    CHECK_EQ(tfs_size(&fs, "b"), 300);
+    CHECK_EQ(sim.violations, 0);
+    teardown();
+}
+
+static void bad_configs_are_rejected(void)
+{
+    struct tfs_config bad;
+    setup(1024, 4, 4);
+    bad = cfg; bad.sector_count = 1;
+    CHECK_EQ(tfs_format(&fs, &bad), TFS_ERR_INVAL);
+    bad = cfg; bad.prog_size = 3;
+    CHECK_EQ(tfs_format(&fs, &bad), TFS_ERR_INVAL);
+    bad = cfg; bad.prog_size = 32;
+    CHECK_EQ(tfs_mount(&fs, &bad), TFS_ERR_INVAL);
+    bad = cfg; bad.sector_size = 1000;
+    CHECK_EQ(tfs_format(&fs, &bad), TFS_ERR_INVAL);
+    bad = cfg; bad.erase = 0;
+    CHECK_EQ(tfs_format(&fs, &bad), TFS_ERR_INVAL);
+    CHECK_EQ(tfs_max_file_size(&bad), TFS_ERR_INVAL);
+    CHECK_EQ(sim.ops, 0);
+    teardown();
+}
+
+static void geometry_mismatch_does_not_mount(void)
+{
+    struct tfs_config other;
+    setup(1024, 4, 4);
+    CHECK_EQ(tfs_format(&fs, &cfg), 0);
+    other = cfg; other.sector_count = 2;
+    CHECK_EQ(tfs_mount(&fs, &other), TFS_ERR_CORRUPT);
+    other = cfg; other.prog_size = 8;
+    CHECK_EQ(tfs_mount(&fs, &other), TFS_ERR_CORRUPT);
+    CHECK_EQ(tfs_mount(&fs, &cfg), 0);
+    teardown();
+}
+
+static void flipped_bit_in_committed_data_is_reported(void)
+{
+    uint32_t i;
+    mounted(1024, 4, 4);
+    CHECK_EQ(tfs_write(&fs, "f", "precious data", 13), 0);
+    for (i = 0; i < 4096 - 13; i++)          /* corrupt the stored payload */
+        if (memcmp(sim.mem + i, "precious data", 13) == 0)
+            break;
+    CHECK(i < 4096 - 13);
+    sim.mem[i + 3] ^= 0x10;
+    CHECK_EQ(tfs_mount(&fs, &cfg), TFS_ERR_CORRUPT);
+    teardown();
+}
+
+static int locks, unlocks, depth, max_depth;
+static void count_lock(void *ctx) { (void)ctx; locks++; if (++depth > max_depth) max_depth = depth; }
+static void count_unlock(void *ctx) { (void)ctx; unlocks++; depth--; }
+
+static void every_call_is_wrapped_in_the_lock(void)
+{
+    char buf[4];
+    tfs_dir_t it;
+    struct tfs_info info;
+    setup(1024, 4, 4);
+    cfg.lock = count_lock;
+    cfg.unlock = count_unlock;
+    locks = unlocks = depth = max_depth = 0;
+    CHECK_EQ(tfs_format(&fs, &cfg), 0);
+    CHECK_EQ(tfs_mount(&fs, &cfg), 0);
+    CHECK_EQ(tfs_write(&fs, "f", "abc", 3), 0);
+    CHECK_EQ(tfs_append(&fs, "f", "d", 1), 0);
+    CHECK_EQ(tfs_size(&fs, "f"), 4);
+    CHECK_EQ(tfs_read(&fs, "f", 0, buf, 4), 4);
+    CHECK_EQ(tfs_dir_open(&fs, &it), 0);
+    CHECK_EQ(tfs_dir_next(&fs, &it, &info), 1);
+    CHECK_EQ(tfs_gc(&fs), 0);
+    CHECK_EQ(tfs_remove(&fs, "f"), 0);
+    CHECK_EQ(tfs_size(&fs, "nope"), TFS_ERR_NOENT);
+    CHECK_EQ(locks, 10);                     /* dir_open touches no flash */
+    CHECK_EQ(unlocks, locks);
+    CHECK_EQ(max_depth, 1);
+    teardown();
+}
+
 void api_tests(void)
 {
     RUN(blank_flash_does_not_mount);
@@ -359,4 +455,9 @@ void api_tests(void)
     RUN(churn_prog16);
     RUN(full_fs_says_nospc_and_keeps_data);
     RUN(largest_file_rewrites_need_three_sectors);
+    RUN(idle_gc_saves_the_next_write_from_collecting);
+    RUN(bad_configs_are_rejected);
+    RUN(geometry_mismatch_does_not_mount);
+    RUN(flipped_bit_in_committed_data_is_reported);
+    RUN(every_call_is_wrapped_in_the_lock);
 }

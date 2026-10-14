@@ -29,6 +29,7 @@ struct sim_flash {
     int powered;
     uint32_t rng;
     long ops;                   /* total program + erase ops performed */
+    long erases;                /* erase ops performed */
     int violations;
 };
 
