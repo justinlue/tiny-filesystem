@@ -351,17 +351,34 @@ static int scan(tfs_t *fs, rec_cb cb, void *ctx)
     }
 }
 
-/* Make room for a record of footprint fp at the head. */
+static uint32_t used_sectors(const tfs_t *fs)
+{
+    uint32_t n = fs->cfg->sector_count;
+    return (fs->head + n - fs->oldest) % n + 1;
+}
+
+static int gc_step(tfs_t *fs);
+
+/* Make room for a record of footprint fp at the head, advancing the head and
+ * collecting garbage as needed. */
 static int ensure_space(tfs_t *fs, uint32_t fp)
 {
     const struct tfs_config *cfg = fs->cfg;
-    uint32_t used = (fs->head + cfg->sector_count - fs->oldest) % cfg->sector_count + 1;
     uint32_t reserve = fp_of(fs, 0, 0);       /* room kept for a GC_DONE record */
-    if (!fs->retired && fs->head_off + fp + reserve <= cfg->sector_size)
-        return 0;
-    if (used + 2 > cfg->sector_count)
-        return TFS_ERR_NOSPC;
-    return activate(fs, next_sec(fs, fs->head), NONE);
+    uint32_t tries;
+    int res;
+    for (tries = 0;; tries++) {
+        if (!fs->retired && fs->head_off + fp + reserve <= cfg->sector_size)
+            return 0;
+        if (tries > cfg->sector_count)
+            return TFS_ERR_NOSPC;
+        if (used_sectors(fs) + 1 < cfg->sector_count)
+            res = activate(fs, next_sec(fs, fs->head), NONE);
+        else
+            res = gc_step(fs);
+        if (res)
+            return res;
+    }
 }
 
 /* ---- lookup ----------------------------------------------------------- */
@@ -494,6 +511,83 @@ static int file_size(tfs_t *fs, const struct rec *base, uint32_t *size, uint32_t
     return res;
 }
 
+/* ---- garbage collection ----------------------------------------------- */
+
+#define BATCH 16
+
+/* Base (newest WRITE/DELETE) of each id in [first, first + BATCH). */
+struct bases {
+    uint32_t first;
+    uint32_t seq[BATCH];
+    uint8_t kind[BATCH];
+};
+
+static int bases_cb(tfs_t *fs, const struct rec *r, void *ctx)
+{
+    struct bases *b = ctx;
+    uint32_t i = (uint32_t)r->id - b->first;
+    (void)fs;
+    if ((r->kind == K_WRITE || r->kind == K_DELETE) && i < BATCH) {
+        b->seq[i] = r->seq;
+        b->kind[i] = r->kind;
+    }
+    return 0;
+}
+
+/* Copy r verbatim to the head. */
+static int copy_record(tfs_t *fs, const struct rec *r)
+{
+    struct wr w;
+    uint32_t fp = fp_of(fs, r->nlen, r->len);
+    memset(&w, 0, sizeof w);
+    w.fs = fs;
+    w.addr = sec_addr(fs, fs->head) + fs->head_off;
+    wr_flash(&w, r->addr, fp - fs->cfg->prog_size);
+    wr_commit(&w);
+    if (w.err)
+        return TFS_ERR_IO;
+    fs->head_off += fp;
+    return 0;
+}
+
+static int copy_live_cb(tfs_t *fs, const struct rec *r, void *ctx)
+{
+    struct bases *b = ctx;
+    uint32_t i = (uint32_t)r->id - b->first;
+    if (i >= BATCH || b->kind[i] != K_WRITE)
+        return 0;
+    if ((r->kind == K_WRITE && r->seq == b->seq[i]) || (r->kind == K_APPEND && r->seq > b->seq[i]))
+        return copy_record(fs, r);
+    return 0;                                  /* dead, or a DELETE / GC_DONE */
+}
+
+/* Compact the oldest sector into the free sector after the head, then erase it.
+ * Only called when exactly one sector is free. */
+static int gc_step(tfs_t *fs)
+{
+    const struct tfs_config *cfg = fs->cfg;
+    struct bases b;
+    struct src none = {0, 0, 0, 0};
+    uint32_t src = fs->oldest, seq, gc_src;
+    int res;
+    if ((res = read_hdr(fs, src, &seq, &gc_src)) != 1)
+        return res < 0 ? res : TFS_ERR_CORRUPT;
+    if ((res = activate(fs, next_sec(fs, fs->head), seq)) != 0)
+        return res;
+    for (b.first = 0; b.first < TFS_MAX_FILES; b.first += BATCH) {
+        memset(b.kind, 0, sizeof b.kind);
+        if ((res = scan(fs, bases_cb, &b)) != 0
+            || (res = scan_sector(fs, src, copy_live_cb, &b, 0, 0, 0)) != 0)
+            return res;
+    }
+    if ((res = put_record(fs, K_GCDONE, 0, 0, 0, &none)) != 0)
+        return res;
+    if (cfg->erase(cfg->ctx, sec_addr(fs, src)))
+        return TFS_ERR_IO;
+    fs->oldest = (uint16_t)next_sec(fs, src);
+    return 0;
+}
+
 /* ---- public API ------------------------------------------------------- */
 
 static void lock(tfs_t *fs)
@@ -531,15 +625,45 @@ static int max_seq_cb(tfs_t *fs, const struct rec *r, void *ctx)
     return 0;
 }
 
+static int gcdone_cb(tfs_t *fs, const struct rec *r, void *ctx)
+{
+    (void)fs;
+    (void)ctx;
+    return r->kind == K_GCDONE;
+}
+
 static int do_mount(tfs_t *fs)
 {
     const struct tfs_config *cfg = fs->cfg;
-    uint32_t i, seq, gc_src, lo = NONE, hi = 0, prev = 0;
-    int res, torn, any = 0;
+    uint32_t i, seq, gc_src, lo = NONE, hi = 0, prev = 0, top = 0, skip;
+    int res, torn = 0, any = 0;
+    /* the newest sector tells whether a GC was in flight */
     for (i = 0; i < cfg->sector_count; i++) {
         if ((res = read_hdr(fs, i, &seq, &gc_src)) < 0)
             return res;
+        if (res && seq >= hi) {
+            hi = seq;
+            top = i;
+            any = 1;
+        }
+    }
+    if (!any)
+        return TFS_ERR_CORRUPT;
+    fs->sector_seq = hi;
+    read_hdr(fs, top, &seq, &gc_src);
+    skip = gc_src;                            /* GC finished: its source is obsolete */
+    if (gc_src != NONE) {
+        if ((res = scan_sector(fs, top, gcdone_cb, 0, 0, 0, 0)) < 0)
+            return res;
         if (!res)
+            skip = hi;                        /* GC interrupted: ignore its target */
+    }
+    hi = 0;
+    any = 0;
+    for (i = 0; i < cfg->sector_count; i++) {
+        if ((res = read_hdr(fs, i, &seq, &gc_src)) < 0)
+            return res;
+        if (!res || seq == skip)
             continue;
         any = 1;
         if (seq < lo) {
@@ -553,11 +677,10 @@ static int do_mount(tfs_t *fs)
     }
     if (!any)
         return TFS_ERR_CORRUPT;
-    fs->sector_seq = hi;
     fs->next_seq = 1;
     /* the log must run oldest..head with rising sequence numbers */
     for (i = fs->oldest;; i = next_sec(fs, i)) {
-        if (read_hdr(fs, i, &seq, &gc_src) != 1 || seq <= prev)
+        if (read_hdr(fs, i, &seq, &gc_src) != 1 || seq <= prev || seq == skip)
             return TFS_ERR_CORRUPT;
         prev = seq;
         if ((res = scan_sector(fs, i, max_seq_cb, &fs->next_seq, &fs->head_off, &torn, 1)) != 0)

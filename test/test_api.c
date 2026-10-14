@@ -235,6 +235,43 @@ static void sixty_fifth_file_is_rejected(void)
     teardown();
 }
 
+/* Many rewrites of a few files: the log wraps through every sector many times. */
+static void churn(uint32_t sectors, uint32_t prog)
+{
+    char name[4] = "f0", buf[200], want[3][200];
+    uint32_t lens[3] = {0, 0, 0};
+    int i, k;
+    mounted(512, sectors, prog);
+    for (i = 0; i < 3000; i++) {
+        k = i % 3;
+        name[1] = (char)('0' + k);
+        lens[k] = (uint32_t)(i * 7 % 60);
+        memset(want[k], 'a' + i % 26, lens[k]);
+        if (i % 5 == 4) {                        /* some appends too */
+            CHECK_EQ(tfs_append(&fs, name, want[k], 3), 0);
+            lens[k] = (uint32_t)tfs_size(&fs, name);
+            CHECK(lens[k] < sizeof buf);
+            CHECK_EQ(tfs_read(&fs, name, 0, want[k], lens[k]), (int)lens[k]);
+        } else {
+            CHECK_EQ(tfs_write(&fs, name, want[k], lens[k]), 0);
+        }
+        if (i % 97 == 0)
+            CHECK_EQ(tfs_mount(&fs, &cfg), 0);
+        for (k = 0; k < 3 && i >= 2; k++) {
+            name[1] = (char)('0' + k);
+            CHECK_EQ(tfs_read(&fs, name, 0, buf, sizeof buf), (int)lens[k]);
+            CHECK(memcmp(buf, want[k], lens[k]) == 0);
+        }
+    }
+    CHECK(sim.ops > 3000);
+    CHECK_EQ(sim.violations, 0);
+    teardown();
+}
+
+static void churn_two_sectors(void) { churn(2, 4); }
+static void churn_eight_sectors(void) { churn(8, 4); }
+static void churn_prog16(void) { churn(4, 16); }
+
 void api_tests(void)
 {
     RUN(blank_flash_does_not_mount);
@@ -248,4 +285,7 @@ void api_tests(void)
     RUN(append_past_max_size_is_rejected);
     RUN(dir_lists_live_files_with_sizes);
     RUN(sixty_fifth_file_is_rejected);
+    RUN(churn_two_sectors);
+    RUN(churn_eight_sectors);
+    RUN(churn_prog16);
 }
