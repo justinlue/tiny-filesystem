@@ -186,6 +186,55 @@ static void append_past_max_size_is_rejected(void)
     teardown();
 }
 
+static void dir_lists_live_files_with_sizes(void)
+{
+    tfs_dir_t it;
+    struct tfs_info info;
+    int seen[3] = {0, 0, 0}, n = 0, res;
+    mounted(1024, 4, 4);
+    CHECK_EQ(tfs_dir_open(&fs, &it), 0);
+    CHECK_EQ(tfs_dir_next(&fs, &it, &info), 0);              /* empty fs */
+    CHECK_EQ(tfs_write(&fs, "alpha", "1", 1), 0);
+    CHECK_EQ(tfs_write(&fs, "gone", "x", 1), 0);
+    CHECK_EQ(tfs_write(&fs, "beta", "22", 2), 0);
+    CHECK_EQ(tfs_append(&fs, "beta", "33", 2), 0);
+    CHECK_EQ(tfs_write(&fs, "0123456789abcde", "", 0), 0);
+    CHECK_EQ(tfs_remove(&fs, "gone"), 0);
+    CHECK_EQ(tfs_dir_open(&fs, &it), 0);
+    while ((res = tfs_dir_next(&fs, &it, &info)) == 1) {
+        n++;
+        if (strcmp(info.name, "alpha") == 0 && info.size == 1)
+            seen[0]++;
+        else if (strcmp(info.name, "beta") == 0 && info.size == 4)
+            seen[1]++;
+        else if (strcmp(info.name, "0123456789abcde") == 0 && info.size == 0)
+            seen[2]++;
+    }
+    CHECK_EQ(res, 0);
+    CHECK_EQ(n, 3);
+    CHECK(seen[0] == 1 && seen[1] == 1 && seen[2] == 1);
+    CHECK_EQ(tfs_dir_next(&fs, &it, &info), 0);              /* stays at end */
+    teardown();
+}
+
+static void sixty_fifth_file_is_rejected(void)
+{
+    char name[8];
+    int i;
+    mounted(4096, 4, 4);
+    for (i = 0; i < TFS_MAX_FILES; i++) {
+        sprintf(name, "f%d", i);
+        CHECK_EQ(tfs_write(&fs, name, "", 0), 0);
+    }
+    CHECK_EQ(tfs_write(&fs, "one-more", "", 0), TFS_ERR_NOFILES);
+    CHECK_EQ(tfs_append(&fs, "one-more", "x", 1), TFS_ERR_NOFILES);
+    CHECK_EQ(tfs_write(&fs, "f7", "still ok", 8), 0);        /* rewrite needs no new id */
+    CHECK_EQ(tfs_remove(&fs, "f3"), 0);
+    CHECK_EQ(tfs_write(&fs, "one-more", "x", 1), 0);
+    CHECK_EQ(tfs_size(&fs, "one-more"), 1);
+    teardown();
+}
+
 void api_tests(void)
 {
     RUN(blank_flash_does_not_mount);
@@ -197,4 +246,6 @@ void api_tests(void)
     RUN(append_creates_then_extends);
     RUN(long_append_chains_read_correctly);
     RUN(append_past_max_size_is_rejected);
+    RUN(dir_lists_live_files_with_sizes);
+    RUN(sixty_fifth_file_is_rejected);
 }

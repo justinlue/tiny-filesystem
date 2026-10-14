@@ -736,3 +736,47 @@ int tfs_append(tfs_t *fs, const char *name, const void *buf, uint32_t len)
     lock(fs);
     return unlock(fs, do_append(fs, name, buf, len));
 }
+
+static int base_cb(tfs_t *fs, const struct rec *r, void *ctx)
+{
+    struct rec *base = ctx;
+    (void)fs;
+    if ((r->kind == K_WRITE || r->kind == K_DELETE) && r->id == base->id)
+        *base = *r;
+    return 0;
+}
+
+int tfs_dir_open(tfs_t *fs, tfs_dir_t *it)
+{
+    (void)fs;
+    it->next_id = 0;
+    return 0;
+}
+
+static int do_dir_next(tfs_t *fs, tfs_dir_t *it, struct tfs_info *info)
+{
+    uint8_t live[TFS_MAX_FILES / 8];
+    struct rec base;
+    uint32_t id = it->next_id;
+    int res = live_ids(fs, live);
+    if (res)
+        return res;
+    while (id < TFS_MAX_FILES && !(live[id >> 3] >> (id & 7) & 1))
+        id++;
+    it->next_id = (uint8_t)(id < TFS_MAX_FILES ? id + 1 : id);
+    if (id == TFS_MAX_FILES)
+        return 0;
+    base.id = (uint16_t)id;
+    if ((res = scan(fs, base_cb, &base)) != 0
+        || (res = rd(fs, base.addr + REC_LEN, info->name, base.nlen)) != 0
+        || (res = file_size(fs, &base, &info->size, 0)) != 0)
+        return res;
+    info->name[base.nlen] = 0;
+    return 1;
+}
+
+int tfs_dir_next(tfs_t *fs, tfs_dir_t *it, struct tfs_info *info)
+{
+    lock(fs);
+    return unlock(fs, do_dir_next(fs, it, info));
+}
