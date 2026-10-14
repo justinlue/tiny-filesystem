@@ -232,25 +232,16 @@ static int read_hdr(tfs_t *fs, uint32_t idx, uint32_t *seq, uint32_t *gc_src)
     return 1;
 }
 
-/* Make sector idx the new head: erase it unless it reads fully erased, then
- * program its header. */
+/* Make sector idx the new head: erase it, then program its header. The erase
+ * is unconditional: flash that reads 0xFF may still hold a program cut short
+ * by power loss, and must not be programmed again. */
 static int activate(tfs_t *fs, uint32_t idx, uint32_t gc_src)
 {
     const struct tfs_config *cfg = fs->cfg;
     struct wr w;
-    uint8_t h[HDR_LEN], tmp[CHUNK];
-    uint32_t off, i;
-    for (off = 0; off < cfg->sector_size; off += CHUNK) {
-        if (rd(fs, sec_addr(fs, idx) + off, tmp, CHUNK))
-            return TFS_ERR_IO;
-        for (i = 0; i < CHUNK && tmp[i] == 0xFF; i++)
-            ;
-        if (i < CHUNK) {
-            if (cfg->erase(cfg->ctx, sec_addr(fs, idx)))
-                return TFS_ERR_IO;
-            break;
-        }
-    }
+    uint8_t h[HDR_LEN];
+    if (cfg->erase(cfg->ctx, sec_addr(fs, idx)))
+        return TFS_ERR_IO;
     put32(h, MAGIC);
     put32(h + 4, fs->sector_seq + 1);
     put32(h + 8, cfg->sector_size);
@@ -597,11 +588,10 @@ static int base_batch(tfs_t *fs, struct bases *b)
     return scan(fs, bases_cb, b);
 }
 
-/* Compact the oldest sector into the free sector after the head, then erase it.
- * Only called when exactly one sector is free. */
+/* Compact the oldest sector into the free sector after the head, which then
+ * leaves the oldest sector free. Only called when exactly one sector is free. */
 static int gc_step(tfs_t *fs)
 {
-    const struct tfs_config *cfg = fs->cfg;
     struct bases b;
     struct src none = {0, 0, 0, 0};
     uint32_t src = fs->oldest, seq, gc_src;
@@ -617,10 +607,8 @@ static int gc_step(tfs_t *fs)
     if ((res = put_record(fs, K_GCDONE, 0, 0, 0, &none)) != 0)
         return res;
     fs->gc_done = 1;
-    if (cfg->erase(cfg->ctx, sec_addr(fs, src)))
-        return TFS_ERR_IO;
-    fs->oldest = (uint16_t)next_sec(fs, src);
-    return 0;
+    fs->oldest = (uint16_t)next_sec(fs, src);  /* src is now the free sector; it is */
+    return 0;                                  /* erased when next activated */
 }
 
 /* ---- public API ------------------------------------------------------- */
@@ -671,61 +659,61 @@ static int do_mount(tfs_t *fs)
 {
     const struct tfs_config *cfg = fs->cfg;
     struct bases b;
-    uint32_t i, seq, gc_src, lo = NONE, hi = 0, prev = 0, top = 0, skip;
-    int res, torn = 0, any = 0;
-    /* the newest sector tells whether a GC was in flight */
-    for (i = 0; i < cfg->sector_count; i++) {
-        if ((res = read_hdr(fs, i, &seq, &gc_src)) < 0)
-            return res;
-        if (res && seq >= hi) {
-            hi = seq;
-            top = i;
-            any = 1;
+    uint32_t i, seq, gc_src, hi = 0, top = NONE, skip = NONE, head_gc = NONE;
+    int res;
+    /* The head is the newest valid sector, unless that is a GC target whose GC
+     * never finished; then the log ends at the sector before it. */
+    for (;;) {
+        for (i = 0; i < cfg->sector_count; i++) {
+            if ((res = read_hdr(fs, i, &seq, &gc_src)) < 0)
+                return res;
+            if (res && i != skip && seq >= hi) {
+                hi = seq;
+                top = i;
+                head_gc = gc_src;
+            }
         }
-    }
-    if (!any)
-        return TFS_ERR_CORRUPT;
-    fs->sector_seq = hi;
-    read_hdr(fs, top, &seq, &gc_src);
-    skip = gc_src;                            /* GC finished: its source is obsolete */
-    if (gc_src != NONE) {
+        if (top == NONE)
+            return TFS_ERR_CORRUPT;
+        if (skip != NONE || head_gc == NONE)
+            break;
         if ((res = scan_sector(fs, top, gcdone_cb, 0, 0, 0, 0)) < 0)
             return res;
-        if (!res)
-            skip = hi;                        /* GC interrupted: ignore its target */
+        if (res)
+            break;
+        fs->sector_seq = hi;
+        skip = top;
+        hi = 0;
+        top = NONE;
     }
-    hi = 0;
-    any = 0;
-    for (i = 0; i < cfg->sector_count; i++) {
+    if (skip == NONE)
+        fs->sector_seq = hi;
+    fs->head = (uint16_t)top;
+    fs->gc_done = head_gc != NONE;
+    /* The log runs back from the head while sequence numbers fall. The sector
+     * after the head is always free: never formatted into, a GC source, or a
+     * GC target that never finished. */
+    fs->oldest = (uint16_t)top;
+    for (i = top ? top - 1 : cfg->sector_count - 1; i != next_sec(fs, top);
+         i = i ? i - 1 : cfg->sector_count - 1) {
         if ((res = read_hdr(fs, i, &seq, &gc_src)) < 0)
             return res;
-        if (!res || seq == skip)
-            continue;
-        any = 1;
-        if (seq < lo) {
-            lo = seq;
-            fs->oldest = (uint16_t)i;
-        }
-        if (seq >= hi) {
-            hi = seq;
-            fs->head = (uint16_t)i;
-        }
+        if (!res || seq >= hi)
+            break;
+        hi = seq;
+        fs->oldest = (uint16_t)i;
     }
-    if (!any)
-        return TFS_ERR_CORRUPT;
     fs->next_seq = 1;
-    /* the log must run oldest..head with rising sequence numbers */
     for (i = fs->oldest;; i = next_sec(fs, i)) {
-        if (read_hdr(fs, i, &seq, &gc_src) != 1 || seq <= prev || seq == skip)
-            return TFS_ERR_CORRUPT;
-        prev = seq;
-        if ((res = scan_sector(fs, i, max_seq_cb, &fs->next_seq, &fs->head_off, &torn, 1)) != 0)
+        if ((res = scan_sector(fs, i, max_seq_cb, &fs->next_seq, 0, 0, 1)) != 0)
             return res;
         if (i == fs->head)
             break;
     }
-    fs->retired = (uint8_t)torn;
-    fs->gc_done = gc_src != NONE;             /* included GC targets have GC_DONE */
+    /* Flash after the data in the head may hold a program that power loss cut
+     * short before it changed any bit: it reads as erased but must not be
+     * programmed again. So writing resumes in a freshly erased sector. */
+    fs->retired = 1;
     for (b.first = 0; b.first < TFS_MAX_FILES; b.first += BATCH)
         if ((res = base_batch(fs, &b)) != 0 || (res = scan(fs, count_live_cb, &b)) != 0)
             return res;

@@ -6,11 +6,13 @@ const char *check_current;
 
 void sim_tests(void);
 void api_tests(void);
+void powercut_tests(void);
 
 int main(void)
 {
     sim_tests();
     api_tests();
+    powercut_tests();
     printf("%d passed, %d failed\n", check_passed, check_failures);
     return check_failures != 0;
 }
