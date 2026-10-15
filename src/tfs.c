@@ -12,7 +12,8 @@
 
 enum { K_WRITE = 0xA1, K_APPEND, K_DELETE, K_GCDONE };
 
-static const uint8_t commit_pat[4] = {0x5A, 0xC3, 0xA5, 0x3C};
+static const uint8_t commit_pat[MAX_PROG] = {0x5A, 0xC3, 0xA5, 0x3C, 0x5A, 0xC3, 0xA5, 0x3C,
+                                             0x5A, 0xC3, 0xA5, 0x3C, 0x5A, 0xC3, 0xA5, 0x3C};
 
 struct rec {
     uint32_t addr, seq, len;
@@ -68,20 +69,6 @@ static int rd(tfs_t *fs, uint32_t addr, void *buf, uint32_t len)
     return fs->cfg->read(fs->cfg->ctx, addr, buf, len) ? TFS_ERR_IO : 0;
 }
 
-static int crc_flash(tfs_t *fs, uint32_t *c, uint32_t addr, uint32_t len)
-{
-    uint8_t tmp[CHUNK];
-    while (len) {
-        uint32_t n = len < CHUNK ? len : CHUNK;
-        if (rd(fs, addr, tmp, n))
-            return TFS_ERR_IO;
-        *c = crc_buf(*c, tmp, n);
-        addr += n;
-        len -= n;
-    }
-    return 0;
-}
-
 static int check_config(const struct tfs_config *cfg)
 {
     uint32_t p = cfg->prog_size, s = cfg->sector_size;
@@ -112,6 +99,16 @@ struct wr {
     uint8_t buf[MAX_PROG];
 };
 
+/* A dry writer only computes the CRC of what is put. */
+static void wr_init(struct wr *w, tfs_t *fs, uint32_t addr, uint8_t dry)
+{
+    memset(w, 0, sizeof *w);
+    w->fs = fs;
+    w->addr = addr;
+    w->crc = NONE;
+    w->dry = dry;
+}
+
 static void wr_put(struct wr *w, const void *src, uint32_t len)
 {
     const uint8_t *p = src;
@@ -141,21 +138,25 @@ static void wr_flash(struct wr *w, uint32_t addr, uint32_t len)
     }
 }
 
-/* Pad the current program unit with 0xFF, then program the commit unit. */
-static void wr_commit(struct wr *w)
+/* Pad the current program unit with 0xFF. */
+static void wr_pad(struct wr *w)
 {
     static const uint8_t ff = 0xFF;
-    uint32_t i;
     while (w->n)
         wr_put(w, &ff, 1);
-    for (i = 0; i < w->fs->cfg->prog_size; i++)
-        wr_put(w, &commit_pat[i & 3], 1);
+}
+
+/* Pad, then program the commit unit. */
+static void wr_commit(struct wr *w)
+{
+    wr_pad(w);
+    wr_put(w, commit_pat, w->fs->cfg->prog_size);
 }
 
 /* Payload of a record being written: the current content of the file whose
  * base is `base` (if any, `base_size` bytes), followed by `len` bytes of data. */
 struct src {
-    const struct rec *base;
+    struct rec *base;
     uint32_t base_size;
     const void *data;
     uint32_t len;
@@ -183,29 +184,22 @@ static int put_record(tfs_t *fs, uint8_t kind, uint16_t id, const char *name, ui
                       const struct src *s)
 {
     struct wr w;
-    uint8_t h[REC_LEN];
+    uint8_t h[REC_LEN], dry;
     h[0] = kind;
     h[1] = nlen;
     h[2] = (uint8_t)id;
     h[3] = (uint8_t)(id >> 8);
     put32(h + 4, fs->next_seq);
     put32(h + 8, s->base_size + s->len);
-
-    memset(&w, 0, sizeof w);                   /* dry pass: CRC only */
-    w.fs = fs;
-    w.dry = 1;
-    w.crc = NONE;
-    wr_put(&w, h, 12);
-    wr_put(&w, name, nlen);
-    feed(&w, s);
-    put32(h + 12, ~w.crc);
-
-    memset(&w, 0, sizeof w);
-    w.fs = fs;
-    w.addr = sec_addr(fs, fs->head) + fs->head_off;
-    wr_put(&w, h, REC_LEN);
-    wr_put(&w, name, nlen);
-    feed(&w, s);
+    for (dry = 1;; dry = 0) {                  /* dry pass: CRC only */
+        wr_init(&w, fs, sec_addr(fs, fs->head) + fs->head_off, dry);
+        wr_put(&w, h, dry ? 12 : REC_LEN);
+        wr_put(&w, name, nlen);
+        feed(&w, s);
+        if (!dry)
+            break;
+        put32(h + 12, ~w.crc);
+    }
     wr_commit(&w);
     if (w.err) {
         fs->retired = 1;                       /* never write after a failed record */
@@ -218,19 +212,31 @@ static int put_record(tfs_t *fs, uint8_t kind, uint16_t id, const char *name, ui
 
 /* ---- sectors ---------------------------------------------------------- */
 
+/* Sector header: magic, geometry, version, seq, gc_src, CRC of the first 20 bytes. */
+static void make_hdr(const tfs_t *fs, uint8_t *h, uint32_t seq, uint32_t gc_src)
+{
+    const struct tfs_config *cfg = fs->cfg;
+    put32(h, MAGIC);
+    put32(h + 4, cfg->sector_size);
+    h[8] = (uint8_t)cfg->sector_count;
+    h[9] = (uint8_t)(cfg->sector_count >> 8);
+    h[10] = VERSION;
+    h[11] = (uint8_t)cfg->prog_size;
+    put32(h + 12, seq);
+    put32(h + 16, gc_src);
+    put32(h + 20, ~crc_buf(NONE, h, 20));
+}
+
 /* 1 = valid header (seq/gc_src filled in), 0 = not a valid sector, < 0 = error. */
 static int read_hdr(tfs_t *fs, uint32_t idx, uint32_t *seq, uint32_t *gc_src)
 {
-    const struct tfs_config *cfg = fs->cfg;
-    uint8_t h[HDR_LEN];
+    uint8_t h[HDR_LEN], want[HDR_LEN];
     if (rd(fs, sec_addr(fs, idx), h, HDR_LEN))
         return TFS_ERR_IO;
-    if (get32(h) != MAGIC || get32(h + 20) != ~crc_buf(NONE, h, 20) || get32(h + 8) != cfg->sector_size
-        || (uint32_t)(h[12] | h[13] << 8) != cfg->sector_count || h[14] != VERSION || h[15] != cfg->prog_size)
-        return 0;
-    *seq = get32(h + 4);
+    *seq = get32(h + 12);
     *gc_src = get32(h + 16);
-    return 1;
+    make_hdr(fs, want, *seq, *gc_src);
+    return memcmp(h, want, HDR_LEN) == 0;
 }
 
 /* Make sector idx the new head: erase it, then program its header. The erase
@@ -243,21 +249,10 @@ static int activate(tfs_t *fs, uint32_t idx, uint32_t gc_src)
     uint8_t h[HDR_LEN];
     if (cfg->erase(cfg->ctx, sec_addr(fs, idx)))
         return TFS_ERR_IO;
-    put32(h, MAGIC);
-    put32(h + 4, fs->sector_seq + 1);
-    put32(h + 8, cfg->sector_size);
-    h[12] = (uint8_t)cfg->sector_count;
-    h[13] = (uint8_t)(cfg->sector_count >> 8);
-    h[14] = VERSION;
-    h[15] = (uint8_t)cfg->prog_size;
-    put32(h + 16, gc_src);
-    put32(h + 20, ~crc_buf(NONE, h, 20));
-    memset(&w, 0, sizeof w);
-    w.fs = fs;
-    w.addr = sec_addr(fs, idx);
+    make_hdr(fs, h, fs->sector_seq + 1, gc_src);
+    wr_init(&w, fs, sec_addr(fs, idx), 0);
     wr_put(&w, h, HDR_LEN);
-    while (w.n)
-        wr_put(&w, "\xFF", 1);
+    wr_pad(&w);
     if (w.err)
         return TFS_ERR_IO;
     fs->sector_seq++;
@@ -275,17 +270,14 @@ static int activate(tfs_t *fs, uint32_t idx, uint32_t gc_src)
 static int scan_sector(tfs_t *fs, uint32_t idx, rec_cb cb, void *ctx, int verify)
 {
     const struct tfs_config *cfg = fs->cfg;
-    uint32_t base = sec_addr(fs, idx), off = al(fs, HDR_LEN), i, fp, c;
+    uint32_t base = sec_addr(fs, idx), off = al(fs, HDR_LEN), fp;
     uint8_t h[REC_LEN], u[MAX_PROG];
     struct rec r;
+    struct wr w;
     int res, bad;
     while (off + fp_of(fs, 0, 0) <= cfg->sector_size) {
-        if (rd(fs, base + off, h, REC_LEN))
+        if (rd(fs, base + off, h, REC_LEN))         /* erased flash fails the checks */
             return TFS_ERR_IO;
-        for (i = 0; i < REC_LEN && h[i] == 0xFF; i++)
-            ;
-        if (i == REC_LEN)
-            break;                                  /* erased: end of data */
         r.addr = base + off;
         r.kind = h[0];
         r.nlen = h[1];
@@ -299,19 +291,19 @@ static int scan_sector(tfs_t *fs, uint32_t idx, rec_cb cb, void *ctx, int verify
         if (!bad && off + fp <= cfg->sector_size) {
             if (rd(fs, base + off + fp - cfg->prog_size, u, cfg->prog_size))
                 return TFS_ERR_IO;
-            for (i = 0; i < cfg->prog_size && u[i] == commit_pat[i & 3]; i++)
-                ;
-            bad = i < cfg->prog_size;
+            bad = memcmp(u, commit_pat, cfg->prog_size) != 0;
         } else {
             bad = 1;
         }
         if (bad)
             break;
         if (verify) {
-            c = crc_buf(NONE, h, 12);
-            if (crc_flash(fs, &c, r.addr + REC_LEN, r.nlen + r.len))
+            wr_init(&w, fs, 0, 1);
+            wr_put(&w, h, 12);
+            wr_flash(&w, r.addr + REC_LEN, r.nlen + r.len);
+            if (w.err)
                 return TFS_ERR_IO;
-            if (~c != get32(h + 12))
+            if (~w.crc != get32(h + 12))
                 return TFS_ERR_CORRUPT;
         }
         if (cb && (res = cb(fs, &r, ctx)) != 0)
@@ -421,17 +413,16 @@ static int find_cb(tfs_t *fs, const struct rec *r, void *ctx)
     return 0;
 }
 
-/* Find the live file called name: 1 = found (f->base is its base WRITE), 0 = none. */
+/* Find the live file called name: 1 = found (f->base is its base WRITE),
+ * TFS_ERR_NOENT = none. */
 static int find(tfs_t *fs, const char *name, struct find *f)
 {
     int res;
     memset(f, 0, sizeof *f);
-    if ((res = check_name(name, &f->nlen)) != 0)
-        return res;
     f->name = name;
-    if ((res = scan(fs, find_cb, f)) != 0)
+    if ((res = check_name(name, &f->nlen)) != 0 || (res = scan(fs, find_cb, f)) != 0)
         return res;
-    return f->found;
+    return f->found ? 1 : TFS_ERR_NOENT;
 }
 
 static int ids_cb(tfs_t *fs, const struct rec *r, void *ctx)
@@ -543,9 +534,7 @@ static int copy_record(tfs_t *fs, const struct rec *r)
 {
     struct wr w;
     uint32_t fp = fp_of(fs, r->nlen, r->len);
-    memset(&w, 0, sizeof w);
-    w.fs = fs;
-    w.addr = sec_addr(fs, fs->head) + fs->head_off;
+    wr_init(&w, fs, sec_addr(fs, fs->head) + fs->head_off, 0);
     wr_flash(&w, r->addr, fp - fs->cfg->prog_size);
     wr_commit(&w);
     if (w.err)
@@ -651,37 +640,42 @@ static int do_mount(tfs_t *fs)
 {
     const struct tfs_config *cfg = fs->cfg;
     struct bases b;
-    uint32_t i, seq, gc_src, hi = 0, top = NONE, skip = NONE, head_gc = NONE;
+    uint32_t i, seq, gc_src, hi = 0, top = NONE, hi2 = 0, top2 = NONE;
     int res;
     /* The head is the newest valid sector, unless that is a GC target whose GC
-     * never finished; then the log ends at the sector before it. */
-    for (;;) {
-        for (i = 0; i < cfg->sector_count; i++) {
-            if ((res = read_hdr(fs, i, &seq, &gc_src)) < 0)
-                return res;
-            if (res && i != skip && seq >= hi) {
+     * never finished; then the log ends at the second newest. */
+    for (i = 0; i < cfg->sector_count; i++) {
+        if ((res = read_hdr(fs, i, &seq, &gc_src)) < 0)
+            return res;
+        if (res && seq >= hi2) {
+            if (seq >= hi) {
+                hi2 = hi;
+                top2 = top;
                 hi = seq;
                 top = i;
-                head_gc = gc_src;
+            } else {
+                hi2 = seq;
+                top2 = i;
             }
         }
+    }
+    fs->sector_seq = hi;
+    for (;;) {
         if (top == NONE)
             return TFS_ERR_CORRUPT;
-        if (skip != NONE || head_gc == NONE)
+        if ((res = read_hdr(fs, top, &seq, &gc_src)) < 0)
+            return res;
+        if (gc_src == NONE || top == top2)
             break;
         if ((res = scan_sector(fs, top, gcdone_cb, 0, 0)) < 0)
             return res;
         if (res)
             break;
-        fs->sector_seq = hi;
-        skip = top;
-        hi = 0;
-        top = NONE;
+        top = top2;
+        hi = hi2;
     }
-    if (skip == NONE)
-        fs->sector_seq = hi;
     fs->head = (uint16_t)top;
-    fs->gc_done = head_gc != NONE;
+    fs->gc_done = gc_src != NONE;
     /* The log runs back from the head while sequence numbers fall. The sector
      * after the head is always free: never formatted into, a GC source, or a
      * GC target that never finished. */
@@ -729,10 +723,7 @@ int tfs_size(tfs_t *fs, const char *name)
     uint32_t size;
     int res;
     lock(fs);
-    res = find(fs, name, &f);
-    if (res == 0)
-        res = TFS_ERR_NOENT;
-    else if (res > 0 && (res = file_size(fs, &f.base, &size, 0, 0)) == 0)
+    if ((res = find(fs, name, &f)) > 0 && (res = file_size(fs, &f.base, &size, 0, 0)) == 0)
         res = (int)size;
     return unlock(fs, res);
 }
@@ -765,8 +756,8 @@ static int do_read(tfs_t *fs, const char *name, uint32_t off, void *buf, uint32_
     struct find f;
     struct rd_ctx r;
     int res = find(fs, name, &f);
-    if (res <= 0)
-        return res ? res : TFS_ERR_NOENT;
+    if (res < 0)
+        return res;
     if (!buf && len)
         return TFS_ERR_INVAL;
     if (!len)
@@ -785,25 +776,62 @@ int tfs_read(tfs_t *fs, const char *name, uint32_t off, void *buf, uint32_t len)
     return unlock(fs, do_read(fs, name, off, buf, len));
 }
 
-static int do_write(tfs_t *fs, const char *name, const void *buf, uint32_t len)
+static int base_cb(tfs_t *fs, const struct rec *r, void *ctx)
+{
+    struct rec *base = ctx;
+    (void)fs;
+    if ((r->kind == K_WRITE || r->kind == K_DELETE) && r->id == base->id)
+        *base = *r;
+    return 0;
+}
+
+/* Write a record at the head, making room first. It replaces old_fp bytes of
+ * live records (the file's previous ones); a DELETE is not itself live. */
+static int emit(tfs_t *fs, uint8_t kind, uint16_t id, const char *name, uint8_t nlen,
+                struct src *s, uint32_t old_fp)
+{
+    uint32_t fp = fp_of(fs, nlen, s->base_size + s->len);
+    int del = kind == K_DELETE, res;
+    if (!del && !fits(fs, fp))
+        return TFS_ERR_NOSPC;
+    if ((res = ensure_space(fs, fp, del)) != 0)
+        return res;
+    if (s->base && (res = scan(fs, base_cb, s->base)) != 0)   /* GC may have moved it */
+        return res;
+    if ((res = put_record(fs, kind, id, name, nlen, s)) != 0)
+        return res;
+    fs->live += (del ? 0 : fp) - old_fp;
+    return 0;
+}
+
+#define MAX_APPENDS 8
+
+/* tfs_write (append = 0) and tfs_append. */
+static int do_put(tfs_t *fs, const char *name, const void *buf, uint32_t len, int append)
 {
     struct find f;
-    struct src s;
+    struct src s = {0, 0, 0, 0};
     uint8_t live[TFS_MAX_FILES / 8];
-    uint32_t size, old_fp = 0, fp;
-    uint16_t id;
-    int res = find(fs, name, &f);
-    if (res < 0)
-        return res;
+    uint32_t size = 0, appends = 0, old_fp = 0;
+    uint16_t id = 0;
+    int found = find(fs, name, &f), res;
+    if (found < 0 && found != TFS_ERR_NOENT)
+        return found;
+    found = found > 0;
     if (!buf && len)
         return TFS_ERR_INVAL;
-    if (len > (uint32_t)tfs_max_file_size(fs->cfg))
-        return TFS_ERR_FBIG;
-    if (res) {
+    s.data = buf;
+    s.len = len;
+    if (found) {
         id = f.base.id;
-        if ((res = file_size(fs, &f.base, &size, 0, &old_fp)) != 0)
+        if ((res = file_size(fs, &f.base, &size, &appends, &old_fp)) != 0)
             return res;
-    } else {
+    }
+    if (!append)
+        size = 0;
+    if (len > (uint32_t)tfs_max_file_size(fs->cfg) - size)
+        return TFS_ERR_FBIG;
+    if (!found) {
         if ((res = live_ids(fs, live)) != 0)
             return res;
         for (id = 0; id < TFS_MAX_FILES && (live[id >> 3] >> (id & 7) & 1); id++)
@@ -811,23 +839,25 @@ static int do_write(tfs_t *fs, const char *name, const void *buf, uint32_t len)
         if (id == TFS_MAX_FILES)
             return TFS_ERR_NOFILES;
     }
-    fp = fp_of(fs, f.nlen, len);
-    if (!fits(fs, fp))
-        return TFS_ERR_NOSPC;
-    if ((res = ensure_space(fs, fp, 0)) != 0)
-        return res;
-    memset(&s, 0, sizeof s);
-    s.data = buf;
-    s.len = len;
-    if ((res = put_record(fs, K_WRITE, id, name, f.nlen, &s)) == 0)
-        fs->live += fp - old_fp;
-    return res;
+    if (found && append) {
+        if (appends < MAX_APPENDS)
+            return emit(fs, K_APPEND, id, 0, 0, &s, 0);
+        s.base = &f.base;                     /* chain is long: write old content + */
+        s.base_size = size;                   /* new data as one WRITE record */
+    }
+    return emit(fs, K_WRITE, id, name, f.nlen, &s, old_fp);
 }
 
 int tfs_write(tfs_t *fs, const char *name, const void *buf, uint32_t len)
 {
     lock(fs);
-    return unlock(fs, do_write(fs, name, buf, len));
+    return unlock(fs, do_put(fs, name, buf, len, 0));
+}
+
+int tfs_append(tfs_t *fs, const char *name, const void *buf, uint32_t len)
+{
+    lock(fs);
+    return unlock(fs, do_put(fs, name, buf, len, 1));
 }
 
 static int do_remove(tfs_t *fs, const char *name)
@@ -836,80 +866,17 @@ static int do_remove(tfs_t *fs, const char *name)
     struct src s = {0, 0, 0, 0};
     uint32_t size, old_fp;
     int res = find(fs, name, &f);
-    if (res <= 0)
-        return res ? res : TFS_ERR_NOENT;
-    if ((res = file_size(fs, &f.base, &size, 0, &old_fp)) != 0
-        || (res = ensure_space(fs, fp_of(fs, 0, 0), 1)) != 0
-        || (res = put_record(fs, K_DELETE, f.base.id, 0, 0, &s)) != 0)
+    if (res < 0)
         return res;
-    fs->live -= old_fp;
-    return 0;
+    if ((res = file_size(fs, &f.base, &size, 0, &old_fp)) != 0)
+        return res;
+    return emit(fs, K_DELETE, f.base.id, 0, 0, &s, old_fp);
 }
 
 int tfs_remove(tfs_t *fs, const char *name)
 {
     lock(fs);
     return unlock(fs, do_remove(fs, name));
-}
-
-#define MAX_APPENDS 8
-
-static int do_append(tfs_t *fs, const char *name, const void *buf, uint32_t len)
-{
-    struct find f;
-    struct src s;
-    uint32_t size, appends, old_fp, fp;
-    int res = find(fs, name, &f);
-    if (res <= 0)
-        return res ? res : do_write(fs, name, buf, len);
-    if (!buf && len)
-        return TFS_ERR_INVAL;
-    if ((res = file_size(fs, &f.base, &size, &appends, &old_fp)) != 0)
-        return res;
-    if (len > (uint32_t)tfs_max_file_size(fs->cfg) - size)
-        return TFS_ERR_FBIG;
-    memset(&s, 0, sizeof s);
-    s.data = buf;
-    s.len = len;
-    if (appends < MAX_APPENDS) {
-        fp = fp_of(fs, 0, len);
-        if (!fits(fs, fp))
-            return TFS_ERR_NOSPC;
-        if ((res = ensure_space(fs, fp, 0)) != 0
-            || (res = put_record(fs, K_APPEND, f.base.id, 0, 0, &s)) != 0)
-            return res;
-        fs->live += fp;
-        return 0;
-    }
-    /* chain is long: write old content + new data as one WRITE record */
-    fp = fp_of(fs, f.nlen, size + len);
-    if (!fits(fs, fp))
-        return TFS_ERR_NOSPC;
-    if ((res = ensure_space(fs, fp, 0)) != 0)
-        return res;
-    if ((res = find(fs, name, &f)) < 0)       /* GC may have moved the records */
-        return res;
-    s.base = &f.base;
-    s.base_size = size;
-    if ((res = put_record(fs, K_WRITE, f.base.id, name, f.nlen, &s)) != 0)
-        return res;
-    fs->live += fp - old_fp;
-    return 0;
-}
-
-int tfs_append(tfs_t *fs, const char *name, const void *buf, uint32_t len)
-{
-    lock(fs);
-    return unlock(fs, do_append(fs, name, buf, len));
-}
-
-static int base_cb(tfs_t *fs, const struct rec *r, void *ctx)
-{
-    struct rec *base = ctx;
-    (void)fs;
-    if ((r->kind == K_WRITE || r->kind == K_DELETE) && r->id == base->id)
-        *base = *r;
-    return 0;
 }
 
 int tfs_dir_open(tfs_t *fs, tfs_dir_t *it)

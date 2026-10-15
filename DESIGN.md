@@ -121,15 +121,17 @@ All multi-byte fields are little-endian. `align(x)` means x rounded up to `prog_
 | Off | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `"TFS1"` |
-| 4 | 4 | `sector_seq` — monotonic per sector activation, starts at 1 |
-| 8 | 4 | `sector_size` (geometry check) |
-| 12 | 2 | `sector_count` (geometry check) |
-| 14 | 1 | format version = 1 |
-| 15 | 1 | `prog_size` (geometry check) |
+| 4 | 4 | `sector_size` (geometry check) |
+| 8 | 2 | `sector_count` (geometry check) |
+| 10 | 1 | format version = 1 |
+| 11 | 1 | `prog_size` (geometry check) |
+| 12 | 4 | `sector_seq` — monotonic per sector activation, starts at 1 |
 | 16 | 4 | `gc_src_seq` — `sector_seq` of the sector this one is compacting, or `0xFFFFFFFF` |
 | 20 | 4 | CRC-32 of bytes 0..19 |
 
 A sector is **valid** if magic and CRC match and the geometry equals the config.
+Mount checks this by rebuilding the header from the config plus the two sequence
+fields it read, and comparing all 24 bytes.
 
 ### Record (after the header, packed, each starts `prog_size`-aligned)
 
