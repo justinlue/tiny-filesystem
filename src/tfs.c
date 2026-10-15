@@ -226,7 +226,7 @@ static int read_hdr(tfs_t *fs, uint32_t idx, uint32_t *seq, uint32_t *gc_src)
     if (rd(fs, sec_addr(fs, idx), h, HDR_LEN))
         return TFS_ERR_IO;
     if (get32(h) != MAGIC || get32(h + 20) != ~crc_buf(NONE, h, 20) || get32(h + 8) != cfg->sector_size
-        || (h[12] | h[13] << 8) != cfg->sector_count || h[14] != VERSION || h[15] != cfg->prog_size)
+        || (uint32_t)(h[12] | h[13] << 8) != cfg->sector_count || h[14] != VERSION || h[15] != cfg->prog_size)
         return 0;
     *seq = get32(h + 4);
     *gc_src = get32(h + 16);

@@ -52,6 +52,8 @@ def elf_sizes(path):
         _, sh_type, flags, _, _, size = struct.unpack_from("<IIIIII", data, shoff + i * shentsize)
         if not flags & 0x2:          # SHF_ALLOC
             continue
+        if sh_type == 0x70000001:    # SHT_ARM_EXIDX: clang emits unwind entries for C
+            continue                 # (zig drops -fno-unwind-tables); GCC builds have none
         if flags & 0x4:              # SHF_EXECINSTR
             text += size
         elif flags & 0x1 or sh_type == 8:  # SHF_WRITE or SHT_NOBITS
@@ -69,6 +71,7 @@ def size():
         run(CC + ["-target", "thumb-freestanding-eabi", f"-mcpu={cpu}", "-std=c99", "-Os",
                   "-ffunction-sections", "-fdata-sections", "-Wall", "-Wextra", "-Werror",
                   "-I", os.path.join(ROOT, "include"),
+                  "-isystem", os.path.join(ROOT, "tools", "freestanding"),
                   "-c", os.path.join(ROOT, "src", "tfs.c"), "-o", obj])
         text, ram = elf_sizes(obj)
         verdict = "ok" if text < TEXT_BUDGET and ram < RAM_BUDGET else "OVER BUDGET"

@@ -143,8 +143,7 @@ static int step(struct world *w, const struct op *o)
     if (res == TFS_ERR_NOENT && o->type == OP_REMOVE && !w->model[o->file].exists)
         return 0;
     if (res != 0) {
-        printf("  op type %d file %d len %u: %d
-", o->type, o->file, o->len, res);
+        printf("  op type %d file %d len %u: %d\n", o->type, o->file, o->len, res);
         return -1;
     }
     apply(&w->model[o->file], o);
@@ -212,8 +211,7 @@ static void every_cut_point(uint32_t sector, uint32_t sectors, uint32_t prog, in
         }
         for (j = k + 1; j < N_OPS; j++) {      /* still fully usable afterwards */
             if (step(&w, &ops[j]) != 0)
-                printf("  cut %ld (op %d type %d): op %d failed afterwards, violations %d
-",
+                printf("  cut %ld (op %d type %d): op %d failed afterwards, violations %d\n",
                        cut, k, ops[k].type, j, w.sim.violations);
             CHECK_EQ(w.sim.violations, 0);
         }
