@@ -256,6 +256,11 @@ in RAM:
 4. **Retire the head.** Flash after the head's data may hold a program that was
    interrupted without changing a bit, so writing resumes in a freshly erased sector.
    Each mount costs the unused tail of one sector, which GC reclaims later.
+   *Considered and declined:* on nRF52, which allows each word to be written twice,
+   mount could skip a single program unit instead of the whole tail. A run of power
+   cuts can then program the same unit a second time. That is legal on nRF52 but not
+   on CC26xx or a generic part, and an earlier skip-based attempt failed the
+   power-cut suite when cuts chained. One retire rule for every target is safer.
 
 **`tfs_gc()`** runs a GC when the next head advance would need one and the head is
 either retired or less than a quarter free. Call it during idle time so writes don't
