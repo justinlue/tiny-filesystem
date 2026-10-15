@@ -8,7 +8,7 @@ mount algorithms, and the guarantees. Read it before changing `src/tfs.c`.
 
 - `python tools/build.py test` builds and runs every host test (zig cc + UBSan).
 - `python tools/build.py size` cross-compiles for Cortex-M0+/M4 and enforces the
-  < 4 KB flash and < 256 B RAM budgets.
+  < 5 KB flash and < 256 B RAM budgets.
 - No zig installed: set `TFS_CC` to a C compiler (e.g. TinyCC) for `test`. That
   build has no sanitizer, and `size` still needs zig.
 

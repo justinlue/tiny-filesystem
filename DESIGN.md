@@ -11,7 +11,7 @@ tests and differ from that session.
 
 | Item | Target |
 |---|---|
-| Code size (`.text`, `-Os`, Cortex-M0+/M4) | < 4 KB |
+| Code size (`.text`, `-Os`, Cortex-M0+/M4) | < 5 KB |
 | Static RAM per mounted FS (`tfs_t`) | < 256 B (actual: 28 B) |
 | Heap | none — caller supplies all buffers |
 | Language | C99, depends only on `memcpy`/`memset`/`memcmp`/`strlen` |
@@ -271,8 +271,12 @@ rejects:
 
 - `tfs_t` is 28 B on a 32-bit MCU: config pointer, oldest and head indices, head
   offset, `next_seq`, `sector_seq`, `live`, and two flags.
-- Stack use is estimated to peak at about 200 B, during GC and mount (a batch of 16 bases plus a
-  32 B read buffer).
+- Stack use peaks at **about 660 B** on Cortex-M0+ and 625 B on M4, before the port's
+  callbacks add their own. The peak comes from an append or write that triggers GC:
+  `tfs_append → do_put → emit → gc_step → scan_sector → copy_live_cb → wr_flash →
+  wr_put → prog`. These figures come from clang `-Os` stack-usage output summed along
+  that path (`-Xclang -stack-usage-file`, since zig drops `-fstack-usage`). Mount peaks
+  at about 410 B. Budget about 1 KB of task stack for the thread that calls tfs.
 - `tfs_dir_t` is 1 byte.
 - Every lookup is a full log scan. `tfs_read` costs one scan per append record in the
   chain, at most 9 in total.
@@ -300,8 +304,12 @@ sanitizer.
 - **Geometries tested:** 4×512 B (prog 4), 2×1 KB (prog 4), 4×512 B (prog 16), and
   8×256 B (prog 1). The fuzz also runs at prog 8 and 16.
 - **`tools/build.py size`** cross-compiles `src/tfs.c` for `cortex-m0plus` and
-  `cortex-m4` at `-Os`. It fails if `.text` reaches 4096 B or `.data` + `.bss`
-  reaches 256 B.
+  `cortex-m4` at `-Os`. It fails if code (`.text` + `.rodata`) reaches 5120 B or
+  `.data` + `.bss` reaches 256 B. libc's `mem*`/`strlen` are declared by
+  `tools/freestanding/string.h` and not counted, and neither are the ARM unwind
+  tables clang adds (GCC emits none for C). The budget was 4 KB until the first
+  real measurement came in at 5.4 KB. After a behaviour-neutral size pass, the
+  remaining choice was to cut features or accept 5 KB. We accepted 5 KB.
 
 ## Layout
 

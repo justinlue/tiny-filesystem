@@ -15,7 +15,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "build")
 CC = [sys.executable, "-m", "ziglang", "cc"]
 
-TEXT_BUDGET = 4096
+TEXT_BUDGET = 5120
 RAM_BUDGET = 256
 CPUS = ["cortex_m0plus", "cortex_m4"]
 

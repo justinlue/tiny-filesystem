@@ -10,6 +10,13 @@
 #define MAX_PROG  16
 #define CHUNK     32
 
+/* Small helpers that clang -Os would otherwise inline at every call site. */
+#if defined(__GNUC__)
+#define NOINLINE __attribute__((noinline))
+#else
+#define NOINLINE
+#endif
+
 enum { K_WRITE = 0xA1, K_APPEND, K_DELETE, K_GCDONE };
 
 static const uint8_t commit_pat[MAX_PROG] = {0x5A, 0xC3, 0xA5, 0x3C, 0x5A, 0xC3, 0xA5, 0x3C,
@@ -27,7 +34,7 @@ typedef int (*rec_cb)(tfs_t *fs, const struct rec *r, void *ctx);
 
 static uint32_t align_p(uint32_t p, uint32_t x) { return (x + p - 1) & ~(p - 1); }
 static uint32_t al(const tfs_t *fs, uint32_t x) { return align_p(fs->cfg->prog_size, x); }
-static uint32_t fp_of(const tfs_t *fs, uint32_t nlen, uint32_t len)
+static NOINLINE uint32_t fp_of(const tfs_t *fs, uint32_t nlen, uint32_t len)
 {
     return al(fs, REC_LEN + nlen + len) + fs->cfg->prog_size;
 }
@@ -44,12 +51,12 @@ static uint32_t get32(const uint8_t *b)
 {
     return b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
 }
-static void put32(uint8_t *b, uint32_t v)
+static NOINLINE void put32(uint8_t *b, uint32_t v)
 {
     b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); b[2] = (uint8_t)(v >> 16); b[3] = (uint8_t)(v >> 24);
 }
 
-static uint32_t crc_byte(uint32_t c, uint8_t b)
+static NOINLINE uint32_t crc_byte(uint32_t c, uint8_t b)
 {
     int k;
     c ^= b;
@@ -100,7 +107,7 @@ struct wr {
 };
 
 /* A dry writer only computes the CRC of what is put. */
-static void wr_init(struct wr *w, tfs_t *fs, uint32_t addr, uint8_t dry)
+static NOINLINE void wr_init(struct wr *w, tfs_t *fs, uint32_t addr, uint8_t dry)
 {
     memset(w, 0, sizeof *w);
     w->fs = fs;
@@ -594,12 +601,12 @@ static int gc_step(tfs_t *fs)
 
 /* ---- public API ------------------------------------------------------- */
 
-static void lock(tfs_t *fs)
+static NOINLINE void lock(tfs_t *fs)
 {
     if (fs->cfg->lock)
         fs->cfg->lock(fs->cfg->ctx);
 }
-static int unlock(tfs_t *fs, int res)
+static NOINLINE int unlock(tfs_t *fs, int res)
 {
     if (fs->cfg->unlock)
         fs->cfg->unlock(fs->cfg->ctx);
